@@ -6,9 +6,10 @@
 
 import asyncio
 import io
+import json
 import time
 import wave
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 from pydantic import BaseModel
@@ -21,6 +22,8 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     StartFrame,
     StartInterruptionFrame,
+    TransportMessageFrame,
+    TransportMessageUrgentFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.serializers.base_serializer import FrameSerializer
@@ -39,13 +42,14 @@ except ModuleNotFoundError as e:
 class WebsocketServerParams(TransportParams):
     add_wav_header: bool = False
     serializer: FrameSerializer
-    session_timeout: int | None = None
+    session_timeout: Optional[int] = None
 
 
 class WebsocketServerCallbacks(BaseModel):
     on_client_connected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
     on_client_disconnected: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
     on_session_timeout: Callable[[websockets.WebSocketServerProtocol], Awaitable[None]]
+    on_websocket_ready: Callable[[], Awaitable[None]]
 
 
 class WebsocketServerInputTransport(BaseInputTransport):
@@ -64,7 +68,7 @@ class WebsocketServerInputTransport(BaseInputTransport):
         self._params = params
         self._callbacks = callbacks
 
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._websocket: Optional[websockets.WebSocketServerProtocol] = None
 
         self._server_task = None
 
@@ -76,26 +80,32 @@ class WebsocketServerInputTransport(BaseInputTransport):
     async def start(self, frame: StartFrame):
         await super().start(frame)
         await self._params.serializer.setup(frame)
-        self._server_task = self.create_task(self._server_task_handler())
+        if not self._server_task:
+            self._server_task = self.create_task(self._server_task_handler())
 
     async def stop(self, frame: EndFrame):
         await super().stop(frame)
         self._stop_server_event.set()
         if self._monitor_task:
             await self.cancel_task(self._monitor_task)
+            self._monitor_task = None
         if self._server_task:
             await self.wait_for_task(self._server_task)
+            self._server_task = None
 
     async def cancel(self, frame: CancelFrame):
         await super().cancel(frame)
         if self._monitor_task:
             await self.cancel_task(self._monitor_task)
+            self._monitor_task = None
         if self._server_task:
             await self.cancel_task(self._server_task)
+            self._server_task = None
 
     async def _server_task_handler(self):
         logger.info(f"Starting websocket server on {self._host}:{self._port}")
         async with websockets.serve(self._client_handler, self._host, self._port) as server:
+            await self._callbacks.on_websocket_ready()
             await self._stop_server_event.wait()
 
     async def _client_handler(self, websocket: websockets.WebSocketServerProtocol, path):
@@ -110,7 +120,7 @@ class WebsocketServerInputTransport(BaseInputTransport):
         await self._callbacks.on_client_connected(websocket)
 
         # Create a task to monitor the websocket connection
-        if self._params.session_timeout:
+        if not self._monitor_task and self._params.session_timeout:
             self._monitor_task = self.create_task(
                 self._monitor_websocket(websocket, self._params.session_timeout)
             )
@@ -158,7 +168,7 @@ class WebsocketServerOutputTransport(BaseOutputTransport):
 
         self._params = params
 
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._websocket: Optional[websockets.WebSocketServerProtocol] = None
 
         # write_raw_audio_frames() is called quickly, as soon as we get audio
         # (e.g. from the TTS), and since this is just a network connection we
@@ -168,7 +178,7 @@ class WebsocketServerOutputTransport(BaseOutputTransport):
         self._send_interval = 0
         self._next_send_time = 0
 
-    async def set_client_connection(self, websocket: websockets.WebSocketServerProtocol | None):
+    async def set_client_connection(self, websocket: Optional[websockets.WebSocketServerProtocol]):
         if self._websocket:
             await self._websocket.close()
             logger.warning("Only one client allowed, using new connection")
@@ -185,6 +195,9 @@ class WebsocketServerOutputTransport(BaseOutputTransport):
         if isinstance(frame, StartInterruptionFrame):
             await self._write_frame(frame)
             self._next_send_time = 0
+
+    async def send_message(self, frame: TransportMessageFrame | TransportMessageUrgentFrame):
+        await self._write_frame(frame)
 
     async def write_raw_audio_frames(self, frames: bytes):
         if not self._websocket:
@@ -242,8 +255,8 @@ class WebsocketServerTransport(BaseTransport):
         params: WebsocketServerParams,
         host: str = "localhost",
         port: int = 8765,
-        input_name: str | None = None,
-        output_name: str | None = None,
+        input_name: Optional[str] = None,
+        output_name: Optional[str] = None,
     ):
         super().__init__(input_name=input_name, output_name=output_name)
         self._host = host
@@ -254,16 +267,18 @@ class WebsocketServerTransport(BaseTransport):
             on_client_connected=self._on_client_connected,
             on_client_disconnected=self._on_client_disconnected,
             on_session_timeout=self._on_session_timeout,
+            on_websocket_ready=self._on_websocket_ready,
         )
-        self._input: WebsocketServerInputTransport | None = None
-        self._output: WebsocketServerOutputTransport | None = None
-        self._websocket: websockets.WebSocketServerProtocol | None = None
+        self._input: Optional[WebsocketServerInputTransport] = None
+        self._output: Optional[WebsocketServerOutputTransport] = None
+        self._websocket: Optional[websockets.WebSocketServerProtocol] = None
 
         # Register supported handlers. The user will only be able to register
         # these handlers.
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
         self._register_event_handler("on_session_timeout")
+        self._register_event_handler("on_websocket_ready")
 
     def input(self) -> WebsocketServerInputTransport:
         if not self._input:
@@ -293,3 +308,6 @@ class WebsocketServerTransport(BaseTransport):
 
     async def _on_session_timeout(self, websocket):
         await self._call_event_handler("on_session_timeout", websocket)
+
+    async def _on_websocket_ready(self):
+        await self._call_event_handler("on_websocket_ready")
