@@ -240,6 +240,7 @@ class ElevenLabsTTSService(InterruptibleWordTTSService):
             "stability": params.stability,
             "similarity_boost": params.similarity_boost,
             "style": params.style,
+            "speed": params.speed,
             "use_speaker_boost": params.use_speaker_boost,
             "speed": params.speed,
             "auto_mode": str(params.auto_mode).lower(),
@@ -500,7 +501,7 @@ class ElevenLabsHttpTTSService(TTSService):
     def can_generate_metrics(self) -> bool:
         return True
 
-    def _set_voice_settings(self):
+    def _set_voice_settings(self) -> Optional[Dict[str, Union[float, bool]]]:
         return build_elevenlabs_voice_settings(self._settings)
 
     async def start(self, frame: StartFrame):
