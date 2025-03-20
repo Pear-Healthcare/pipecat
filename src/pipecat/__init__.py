@@ -8,6 +8,6 @@ from importlib.metadata import version
 
 from loguru import logger
 
-__version__ = version("pipecat-ai")
+__version__ = version("pear-pipecat")
 
-logger.info(f"ᓚᘏᗢ Pipecat {__version__} ᓚᘏᗢ")
+logger.info(f"ᓚᘏᗢ Pear Pipecat {__version__} ᓚᘏᗢ")
